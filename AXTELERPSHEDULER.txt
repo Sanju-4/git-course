@@ -1,0 +1,805 @@
+package ext.util;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+
+import org.apache.commons.io.comparator.LastModifiedFileComparator;
+import org.apache.log4j.Logger;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
+
+import com.google.common.io.Files;
+import com.ptc.core.lwc.server.PersistableAdapter;
+
+import wt.fc.ObjectReference;
+import wt.fc.Persistable;
+import wt.fc.PersistenceHelper;
+import wt.fc.PersistenceServerHelper;
+import wt.fc.QueryResult;
+import wt.fc.collections.WTCollection;
+import wt.fc.collections.WTHashSet;
+import wt.fc.collections.WTSet;
+import wt.iba.value.AttributeContainer;
+import wt.iba.value.DefaultAttributeContainer;
+import wt.iba.value.IBAHolder;
+import wt.iba.value.service.IBAValueDBService;
+import wt.identity.IdentityFactory;
+import wt.log4j.LogR;
+import wt.maturity.MaturityHelper;
+import wt.maturity.PromotionNotice;
+import wt.org.WTPrincipal;
+import wt.part.WTPart;
+import wt.pds.StatementSpec;
+import wt.pom.Transaction;
+import wt.query.QuerySpec;
+import wt.query.SearchCondition;
+import wt.queue.ScheduleQueue;
+import wt.queue.ScheduleQueueEntry;
+import wt.queue.StandardQueueService;
+import wt.queue.StatusInfo;
+import wt.queue.WtQueue;
+import wt.session.SessionHelper;
+import wt.util.WTException;
+import wt.util.WTProperties;
+import wt.util.WTPropertyVetoException;
+import wt.vc.baseline.BaselineHelper;
+import wt.vc.baseline.Baselineable;
+import wt.vc.baseline.ManagedBaseline;
+import wt.vc.config.LatestConfigSpec;
+import wt.vc.wip.WorkInProgressHelper;
+
+public class ErpQueueScheduler {
+
+
+	public static WTProperties prop = CustomProperties.getCustomProperties("//ext//custom.properties");
+
+	public static final String QUEUENAME = StandardQueueService.COMMON_SCHEDULE_QUEUE;
+
+	public static final String CLASSNAME = ErpQueueScheduler.class.getName();
+
+	private static final Logger LOGGER = LogR.getLogger(CLASSNAME);
+
+	public static final String METHODNAME = "createOrUpdateQueue";
+
+	public static final long MS_PER_MIN = 60l * 1000l;
+
+	public static long MS_INT;
+
+	public static final String FEATURE_LOAD_DTD_GRAMMAR = "http://apache.org/xml/features/nonvalidating/load-dtd-grammar";
+	public static final String FEATURE_LOAD_EXTERNAL_DTD = "http://apache.org/xml/features/nonvalidating/load-external-dtd";
+
+	public static void initialize(WtQueue queue) throws WTException {
+		createOrUpdateQueue(queue);
+	}
+
+	public static ScheduleQueue getQueue(String scheduleQueue) throws WTException {
+
+		ScheduleQueue queue = null;
+		try {
+			final QuerySpec qs = new QuerySpec(ScheduleQueue.class);
+			qs.appendWhere(
+					new SearchCondition(ScheduleQueue.class, ScheduleQueue.NAME, SearchCondition.EQUAL, scheduleQueue),
+					new int[] { 0 });
+			QueryResult result = PersistenceHelper.manager.find((StatementSpec) qs);
+			if (result.hasMoreElements()) {
+				queue = (ScheduleQueue) result.nextElement();
+			}
+		} catch (WTException e) {
+			System.out.printf("Unable to build or execute query", e);
+		}
+		return queue;
+	}
+
+	public static void createOrUpdateQueue() throws WTException {
+		System.out.println("Entering createOrUpdateQueue()");
+		ScheduleQueue queue = getQueue("commonScheduleQueue");
+
+		QueryResult entryResult = getScheduleQueueEntries(queue, ErpQueueScheduler.CLASSNAME,
+				ErpQueueScheduler.METHODNAME);
+		System.out.println("entryResult: " + entryResult.size());
+		while (entryResult.hasMoreElements()) {
+			final ScheduleQueueEntry entry = (ScheduleQueueEntry) entryResult.nextElement();
+			final String statusCode = entry.getStatusInfo().getCode();			
+			if (statusCode.equals(StatusInfo.FAILED) || statusCode.equals(StatusInfo.SEVERE)
+					|| statusCode.equals(StatusInfo.COMPLETED) || statusCode.equals(StatusInfo.NONEVENTFAILED)) {
+				try {
+					PersistenceServerHelper.manager.remove(entry);
+				} catch (WTException e) {
+					System.out.println("Unable to remove failed entry from schedule queue" + e);
+				}
+			}				
+		}		
+		scheduleNewJob(queue, ErpQueueScheduler.CLASSNAME, ErpQueueScheduler.METHODNAME, getInterval());
+		try {
+			updateErpStatus();
+		} catch (WTException | IOException | SAXException | ParserConfigurationException e) {
+			// TODO Auto-generated catch block
+			System.out.print("Error in updateErpStatus " + e.getLocalizedMessage());
+			e.printStackTrace();
+		}
+	}
+
+	public static void createOrUpdateQueue(WtQueue queue) throws WTException 
+	{
+		System.out.println("Entering createOrUpdateQueue()");
+		QueryResult entryResult = getScheduleQueueEntries((ScheduleQueue)queue, ErpQueueScheduler.CLASSNAME,
+				ErpQueueScheduler.METHODNAME);
+		System.out.println("entryResult: " + entryResult.size());
+		boolean existingScheduledJob = false;
+
+		boolean queueExecuting = false;
+
+		if (entryResult.hasMoreElements()) {
+			System.out.println("queue entry available in common schedule");
+			while (entryResult.hasMoreElements()) {
+				final ScheduleQueueEntry entry = (ScheduleQueueEntry) entryResult.nextElement();
+				final String statusCode = entry.getStatusInfo().getCode();
+
+				if (statusCode.equals(StatusInfo.READY)) {
+					existingScheduledJob = true;
+				} else if (statusCode.equals(StatusInfo.FAILED) || statusCode.equals(StatusInfo.SEVERE)
+						|| statusCode.equals(StatusInfo.COMPLETED) || statusCode.equals(StatusInfo.NONEVENTFAILED)) {
+					try {
+						PersistenceServerHelper.manager.remove(entry);
+					} catch (WTException e) {
+						System.out.println("Unable to remove failed entry from schedule queue" + e);
+					}
+				} else if (statusCode.equals(StatusInfo.EXECUTING)) {
+					queueExecuting = true;
+				}
+			}
+
+			System.out.println("existingScheduledJob: " + existingScheduledJob);
+			System.out.println("queueExecuting: " + queueExecuting);
+
+			if (existingScheduledJob && !queueExecuting) {
+				System.out.println("Entry already in queue createOrUpdateQueue" + existingScheduledJob);
+				try {
+					updateErpStatus();
+				} catch (WTException | IOException | SAXException | ParserConfigurationException e) {
+					// TODO Auto-generated catch block
+					System.out.print("Error in updateErpStatus " + e.getLocalizedMessage());
+					e.printStackTrace();
+				}
+
+			} else {
+				System.out.println("Creating new entry");
+				scheduleNewJob((ScheduleQueue)queue, ErpQueueScheduler.CLASSNAME, ErpQueueScheduler.METHODNAME, getInterval());
+			}
+		} else {
+			System.out.println("queue entry not available in common schedule");
+			try {
+				updateErpStatus();
+			} catch (WTException | IOException | SAXException | ParserConfigurationException e) {
+				// TODO Auto-generated catch block
+				System.out.print("Error in updateErpStatus " + e.getLocalizedMessage());
+				e.printStackTrace();
+			}
+			scheduleNewJob((ScheduleQueue)queue, ErpQueueScheduler.CLASSNAME, ErpQueueScheduler.METHODNAME, getInterval());
+		}
+		
+	}
+
+	public static QueryResult getScheduleQueueEntries(ScheduleQueue scheduleQueue, String aTargetClass,
+			String aTargetMethod) throws WTException {
+
+		try {
+			QuerySpec qs = new QuerySpec(ScheduleQueueEntry.class);
+			qs.appendWhere(new SearchCondition(ScheduleQueueEntry.class, ScheduleQueueEntry.TARGET_METHOD,
+					SearchCondition.EQUAL, aTargetMethod), new int[] { 0 });
+			qs.appendAnd();
+			qs.appendWhere(new SearchCondition(ScheduleQueueEntry.class, ScheduleQueueEntry.TARGET_CLASS,
+					SearchCondition.EQUAL, aTargetClass), new int[] { 0 });
+			qs.appendAnd();
+			qs.appendWhere(new SearchCondition(ScheduleQueueEntry.class,
+					ScheduleQueueEntry.QUEUE_REF + "." + ObjectReference.OBJECT_ID, SearchCondition.EQUAL,
+					scheduleQueue.getPersistInfo().getObjectIdentifier()), new int[] { 0 });
+			System.out.println("qs===============> " + qs.toString());
+			return PersistenceHelper.manager.find((StatementSpec) qs);
+		} catch (WTException e) {
+			LOGGER.error("Unable to build or execute query", e);
+			throw e;
+		}
+	}
+
+	public static void scheduleNewJob(final ScheduleQueue queue, String aTargetClass, String aTargetMethod,
+			long aInterval) {
+
+		if (LOGGER.isTraceEnabled()) {
+			LOGGER.trace(
+					"Entering::scheduleNewJob() at " + new SimpleDateFormat("yyyy-MM-dd hh:mm:ss").format(new Date()));
+		}
+
+		final Timestamp future = new Timestamp(System.currentTimeMillis() + aInterval);
+		final Class<?>[] argTypes = new Class<?>[0];
+		final Object[] args = new Object[0];
+
+		if (LOGGER.isDebugEnabled()) {
+			LOGGER.debug("Scheduling job to run at " + future.toString() + " [" + aTargetClass + "." + aTargetMethod
+					+ "()]");
+		}
+
+		try {
+			final WTPrincipal admin = SessionHelper.manager.getAdministrator();
+			queue.addEntry(admin, aTargetMethod, aTargetClass, argTypes, args, future);
+		} catch (WTException e) {
+			LOGGER.error("ERROR scheduing job for::scheduleNewJob()");
+		}
+
+		if (LOGGER.isTraceEnabled()) {
+			LOGGER.trace("Exiting::scheduleNewJob()");
+		}
+	}
+
+	public static long getInterval() {
+		String interval = prop.getProperty("TIME_INTERVAL");
+		if (interval != null) {
+			if (interval.length() == 0) {
+				System.out.println("TIME_INTERVAL property is empty");
+			}
+
+		} else {
+			System.out.println("TIME_INTERVAL property not set");
+		}
+		MS_INT = MS_PER_MIN * Integer.parseInt(interval);
+		return MS_INT;
+	}
+
+	@SuppressWarnings("unchecked")
+	public static void updateErpStatus() throws WTException, IOException, SAXException, ParserConfigurationException
+	{
+		System.out.println("Entering updateErpStatus()");
+		String inputFilePath = prop.getProperty("ERP_INPUT_PATH");
+		System.out.println("ERPInputPath " +inputFilePath);
+		if(inputFilePath != null)
+		{
+			if(inputFilePath.length() == 0)
+			{
+				throw new WTException("ERP_INPUT_PATH property is empty");
+			}
+		}
+		else
+		{
+			throw new WTException("ERP_INPUT_PATH property not set");
+		}
+		File inputPath = new File(inputFilePath);
+		if(!inputPath.exists())
+		{
+			throw new WTException("Folder "+inputFilePath+" does not exist");
+		}
+		
+		boolean filesUpdated = true;//CopyFilesFromlocal(inputFilePath);
+		System.out.println("filesUpdated: "+filesUpdated);
+		
+		if(filesUpdated)
+		{
+			String archivedFilePath = prop.getProperty("ERP_ARCH_PATH");
+			File archivedPath = new File(inputFilePath+archivedFilePath);
+			System.out.println("archive"+archivedPath);
+			if(!archivedPath.exists())
+			{
+				archivedPath.mkdirs();
+			}
+			
+			String tempFilePath = prop.getProperty("ERP_TEMP_PATH");
+			File tempPath = new File(tempFilePath);
+			if(!tempPath.exists())
+			{
+				tempPath.mkdirs();
+			}
+			
+			File[] fileList = inputPath.listFiles();
+			if(fileList.length > 1)
+			{
+				Arrays.sort(fileList, LastModifiedFileComparator.LASTMODIFIED_COMPARATOR);
+			}		
+			for (int i = 0; i < fileList.length; i++) {
+				File file = fileList[i];
+				System.out.println("file: "+file.getAbsolutePath());
+				if(file.getName().endsWith(".xml"))
+				{
+					System.out.println("File: %s - " + new Date(file.lastModified()) + "\n" + file.getName());
+					File archFile = new File(archivedPath + prop.getProperty("SEPARATOR") + file.getName());
+					Files.copy(file, archFile);
+					File tempFile = new File(tempPath + prop.getProperty("SEPARATOR") + file.getName() + ".importing");
+					File logFile = new File(tempPath + prop.getProperty("SEPARATOR") + file.getName() + ".log");
+					Files.copy(file, tempFile);
+					Document output = null;
+					// Standard XML DOM parser
+					DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+					factory.setCoalescing(false);
+					factory.setValidating(false);
+					factory.setIgnoringElementContentWhitespace(true);
+					factory.setXIncludeAware(false);
+					factory.setNamespaceAware(true);
+					output = factory.newDocumentBuilder().parse(tempFile);
+					String transId = getTransactionIdFromFileName(file.getName());
+					System.out.println("processing file: "+tempFile.getAbsolutePath());
+					updateErpObject(output, logFile, transId);	
+					file.delete();
+				}					
+			}
+		}
+		else
+		{
+			throw new WTException("FTP connection failed");
+		}		
+	}
+
+	public static String getTransactionIdFromFileName(String name) {
+		String transId = "-";
+		try {
+			System.out.println("name: " + name);
+			String nameWithoutExt = name.split("\\.")[0];
+			String[] strs = nameWithoutExt.split("_");
+			int len = strs.length;
+			transId = strs[(len - 1)];
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+
+		return transId;
+	}
+
+	public static void updateErpObject(Document doc, File logFile, String transId) throws IOException {
+		System.out.println("Entering updateErpObject()");
+
+		doc.getDocumentElement().normalize();
+		BufferedWriter logwriter = null;
+		Map<String, ArrayList<String>> erpResponseParamMap = new HashMap<String, ArrayList<String>>();
+
+		NodeList createResNodeList = doc.getElementsByTagName("ReturnMessage");
+		NodeList createnewResNodeList = doc.getElementsByTagName("ECNHeader");
+		
+		try {
+			logwriter = new BufferedWriter(new FileWriter(logFile));
+			 System.out.println("ReturnMessage");
+			updateMap(createResNodeList,createnewResNodeList,erpResponseParamMap, transId);
+			 System.out.println("ECNHeader");
+			//updateMap(createnewResNodeList, erpResponseParamMap, transId);
+			System.out.println("erpResponseParamMap Entries: ");
+			Set<String> keys = erpResponseParamMap.keySet();
+			for (String key:keys)
+				{
+				 System.out.println("+++ keys: " + key);
+				}
+			for (String key : keys) {
+				ArrayList<String> vals = erpResponseParamMap.get(key);
+				 System.out.println("Key: " + key);
+				 int i=0;
+				for (String val:vals)
+				{
+					
+				 System.out.println("#### Value["+i+"]" + val);
+				 i++;
+				}
+				
+				WTPart part = getPart(key);
+				
+				if (part != null) {
+					if (WorkInProgressHelper.isCheckedOut(part)) {
+						logwriter.write(key+" , "+vals+" ==>Failed as object is checked out");
+						logwriter.newLine();
+						continue;
+					}
+					System.out.println("Creating a new transaction for updating the axtel part" + part.getNumber());                    
+                    
+					Transaction tr = new Transaction();
+					try {
+						tr.start();			
+						Map<PromotionNotice, WTSet> promotionRequestDetails = removedFromPromotionRequest(part);
+						part = (WTPart) PersistenceHelper.manager.refresh(part);
+						Map<ManagedBaseline,Baselineable> baselineDetails = findBaselines(part);
+						removeFromBaseline(baselineDetails);
+						part = (WTPart) PersistenceHelper.manager.refresh(part);
+						Locale locale = SessionHelper.getLocale();
+						
+						PersistableAdapter adapter = new PersistableAdapter(part, null, locale, null);
+						adapter.load(prop.getProperty("ATTR_ERP_Success"), prop.getProperty("ATTR_ERP_msg"));
+						adapter.set(prop.getProperty("ATTR_ERP_Success"), vals.get(0));
+						System.out.println("success value" +vals.get(0));
+						adapter.set(prop.getProperty("ATTR_ERP_msg"), vals.get(1));
+						System.out.println("message value" +vals.get(1));
+						adapter.apply();
+						updateIBAHolder((IBAHolder) adapter.apply());						
+						tr.commit();
+						tr = null;
+						part = (WTPart) PersistenceHelper.manager.refresh(part);
+						if (promotionRequestDetails != null && promotionRequestDetails.size() > 0)
+	                    {
+	                        addToPromotionRequest(promotionRequestDetails);
+	                    }
+						part = (WTPart) PersistenceHelper.manager.refresh(part);
+						if(baselineDetails.size() > 0) {
+							addToBaseline(baselineDetails);
+						}
+						part = (WTPart) PersistenceHelper.manager.refresh(part);
+						logwriter.write(key+" , "+vals+" ==>Attributes Updated successfully");
+						logwriter.newLine();
+						String iSoapBodyXml = createSoapXml(vals);
+					} catch (WTException e) {
+						e.printStackTrace();
+						logwriter.write(key+" , "+vals+" ==>Failed with error "+e.getLocalizedMessage().replaceAll("\n", "@"));
+						logwriter.newLine();
+					} finally {
+
+						if (tr != null) {
+							tr.rollback();
+						}
+					}
+				} 
+				
+				
+		}
+	}		catch (WTException | IOException e) {
+			e.printStackTrace();
+		} finally {
+			if (logwriter != null) {
+				logwriter.close();
+			}
+		}
+
+	}
+	
+	private static Map<ManagedBaseline, Baselineable> findBaselines(WTPart part) 
+	{
+	  Map<ManagedBaseline, Baselineable> baselineDetails = new HashMap<ManagedBaseline, Baselineable>();
+	  try {
+		  	QueryResult baselines = BaselineHelper.service.getManagedBaselines(part);
+		  	System.out.println("baselines: "+baselines.size());
+			while(baselines.hasMoreElements()) {
+				ManagedBaseline managed = (ManagedBaseline) baselines.nextElement();
+				System.out.println("managed baseline details:"+managed.getIdentity());
+				baselineDetails.put(managed, part);
+			}		  
+	  }catch(WTException e) {
+		  LOGGER.error("Error in finding baselines");		 
+	  }
+	  return baselineDetails;
+		
+	}
+  
+  private static void removeFromBaseline(Map<ManagedBaseline, Baselineable> baselineDetails)
+	{
+	  	try {
+	  		Iterator<Entry<ManagedBaseline, Baselineable>> itr = baselineDetails.entrySet().iterator();
+			while (itr.hasNext())
+			{
+				Entry<ManagedBaseline, Baselineable> entry = itr.next();
+				ManagedBaseline baseline = entry.getKey();
+				Baselineable baselineItem  = entry.getValue();
+				System.out.println("Start of Removing of baseline item: "+IdentityFactory.getDisplayIdentifier(baselineItem)+" from baseline: "+baseline.getName());	//Code changes for Upgrade from Windchill 10.2 M022 to Windchill 12.0.2 CPS03
+				BaselineHelper.service.removeFromBaseline(baselineItem, baseline);	
+				//removed = true;
+				System.out.println("End of baseline item: "+IdentityFactory.getDisplayIdentifier(baselineItem)+" from baseline: "+baseline.getName());	//Code changes for Upgrade from Windchill 10.2 M022 to Windchill 12.0.2 CPS03
+			}
+	  		
+	  	}catch(WTException e) {
+	  		LOGGER.error("Error in finding baselines");
+	  		e.printStackTrace();
+			  //removed = false;
+		  }
+		
+	  	//return removed;
+	}
+  
+  public static void updateIBAHolder(IBAHolder ibaholder) throws WTException { 
+      // NOTE: This method works only at server level, because it uses the
+		// PersistenceServerHelper class.
+      
+		IBAValueDBService ibavaluedbservice = new IBAValueDBService();
+		wt.fc.PersistenceServerHelper.manager.update((Persistable) ibaholder);
+		AttributeContainer attributecontainer = ibaholder.getAttributeContainer();
+		Object obj = ((DefaultAttributeContainer) attributecontainer).getConstraintParameter();
+		AttributeContainer attributecontainer1 = ibavaluedbservice.updateAttributeContainer(ibaholder, obj, null, null);
+		ibaholder.setAttributeContainer(attributecontainer1);
+	}
+  
+  private static void addToBaseline(Map<ManagedBaseline, Baselineable> baselineDetails)
+	{
+	  	//boolean removed = false;
+	  	try {
+	  		Iterator<Entry<ManagedBaseline, Baselineable>> itr = baselineDetails.entrySet().iterator();
+			while (itr.hasNext())
+			{
+				Entry<ManagedBaseline, Baselineable> entry = itr.next();
+				ManagedBaseline baseline = entry.getKey();
+				Baselineable baselineItem  = entry.getValue();
+				System.out.println("Start of Removing of baseline item: "+IdentityFactory.getDisplayIdentifier(baselineItem)+" from baseline: "+baseline.getName());	//Code changes for Upgrade from Windchill 10.2 M022 to Windchill 12.0.2 CPS03
+				BaselineHelper.service.addToBaseline(baselineItem, baseline);	
+				//removed = true;
+				System.out.println("End of baseline item: "+IdentityFactory.getDisplayIdentifier(baselineItem)+" from baseline: "+baseline.getName());	//Code changes for Upgrade from Windchill 10.2 M022 to Windchill 12.0.2 CPS03
+			}
+	  		
+	  	}catch(WTException e) {
+	  		System.out.println("Error in finding baselines");
+			  //removed = false;
+	  		e.printStackTrace();
+		  }
+		
+	  	//return removed;
+	}
+	
+	private static String createSoapXml(ArrayList<String> ivals) {
+	   System.out.println("entering createSoapXml()"); 
+    StringBuilder soapXml = new StringBuilder();
+    soapXml.append("<soapenv:Envelope xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" ");
+    soapXml.append("xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" ");
+    soapXml.append("xmlns:mes=\"http://www.ptc.com/infoengine/soap/rpc/message/\">\n");
+    soapXml.append("   <soapenv:Header/>\n");
+    soapXml.append("   <soapenv:Body>\n");
+    soapXml.append("      <mes:PostResult soapenv:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\n");
+    soapXml.append("         <ObjectID xsi:type=\"xsd:string\">").append(ivals.get(4)).append("</ObjectID>\n");
+    soapXml.append("         <ObjectDescription xsi:type=\"xsd:string\">").append(ivals.get(7)).append("</ObjectDescription>\n");
+    soapXml.append("         <TargetID xsi:type=\"xsd:string\">").append(ivals.get(2)).append("</TargetID>\n");
+    soapXml.append("         <Successful xsi:type=\"xsd:string\">").append("true").append("</Successful>\n");
+    soapXml.append("         <Subtransaction xsi:type=\"xsd:string\">").append("true").append("</Subtransaction>\n");
+    soapXml.append("         <TransactionID xsi:type=\"xsd:string\">").append(ivals.get(2)).append("</TransactionID>\n");
+	 java.time.LocalDateTime now = java.time.LocalDateTime.now();  
+    soapXml.append("         <Timestamp xsi:type=\"xsd:string\">").append(now.toString()).append("</Timestamp>\n");
+    soapXml.append("         <Message xsi:type=\"xsd:string\">").append(ivals.get(1)).append("</Message>\n");
+    soapXml.append("         <Class xsi:type=\"xsd:string\">").append(ivals.get(8)).append("</Class>\n");
+    soapXml.append("         <Action xsi:type=\"xsd:string\">").append("Change").append("</Action>\n");
+    soapXml.append("      </mes:PostResult>\n");
+    soapXml.append("   </soapenv:Body>\n");
+    soapXml.append("</soapenv:Envelope>");
+	System.out.println("createSoapXml() created"); 
+	System.out.println(soapXml.toString()); 
+    return soapXml.toString();
+  }
+  
+	public static Map<PromotionNotice, WTSet> removedFromPromotionRequest(WTPart part)
+    {
+
+        try
+        {
+            Map<PromotionNotice, WTSet> promotablesList = new HashMap<PromotionNotice, WTSet>();
+            WTCollection promotables = new WTHashSet();
+            promotables.add(part);
+            WTCollection output = MaturityHelper.service.getPromotionNotices(promotables);
+            System.out.println("No of Promotion request: " + output.size() + " for :" + part.getIdentity());
+            if (output.size() > 0)
+            {
+                Iterator itr = output.persistableIterator();
+                while (itr.hasNext())
+                {
+                    PromotionNotice pn = (PromotionNotice) itr.next();
+                    System.out.println("pn: " + pn.getNumber());
+                    MaturityHelper.service.deletePromotionTargets(pn, (WTSet) promotables);
+                    promotablesList.put(pn, (WTSet) promotables);
+                    System.out.println("Promotables: " + part.getIdentity() + " is removed from pn: " + pn.getNumber());
+                }
+            }
+            return promotablesList;
+        }
+        catch (WTException e)
+        {
+            LOGGER.error("Error in removedFromPromotionRequest: WTException", e);
+            e.printStackTrace();
+            return null;
+        }
+    }
+	
+	public static void addToPromotionRequest(Map<PromotionNotice, WTSet> promotionRequestDetails)
+    {
+        try
+        {
+            Iterator<Entry<PromotionNotice, WTSet>> itr = promotionRequestDetails.entrySet().iterator();
+            while (itr.hasNext())
+            {
+                Entry<PromotionNotice, WTSet> entry = itr.next();
+                PromotionNotice pn = entry.getKey();
+                WTSet promotables = entry.getValue();
+                System.out.println("Start of adding of baseline item: " + promotables + " from baseline: " + pn.getNumber());
+                MaturityHelper.service.savePromotionTargets(pn, promotables);
+                System.out.println("End of adding of baseline item: " + promotables + " from baseline: " + pn.getNumber());
+            }
+        }
+        catch (WTException e)
+        {
+            LOGGER.error("Failed in addToPromotionRequest WTException: ", e);
+            e.printStackTrace();
+        }
+        catch (WTPropertyVetoException f)
+        {
+            LOGGER.error("Failed in addToPromotionRequest WTPropertyVetoException: ", f);
+            f.printStackTrace();
+        }
+    }
+
+	
+
+
+	public static WTPart getPart(String ObjNumber) throws WTException {
+
+	System.out.println("Inside the part block");
+
+		WTPart part = null;
+		if (ObjNumber != null && !ObjNumber.isEmpty()) {
+			QuerySpec qs = new QuerySpec(WTPart.class);
+			int[] index = new int[] { 0 };
+			qs.appendWhere(new SearchCondition(WTPart.class, WTPart.NUMBER, SearchCondition.EQUAL, ObjNumber), index);
+			QueryResult qr = PersistenceHelper.manager.find((StatementSpec) qs);
+			LatestConfigSpec config = new LatestConfigSpec();
+			qr = config.process(qr);
+			System.out.println("Size  for part is " + qr.size());
+			if (qr.hasMoreElements()) {
+				part = (WTPart) qr.nextElement();
+			}
+		}
+		return part;
+
+	}
+
+ private static String getNodeValue(Node eElement, String nodeName) {
+    System.out.println("Getting node value for: " + nodeName);
+    Element eElement1 = (Element)eElement;
+    String result = "";
+    if (eElement1.getTagName().equalsIgnoreCase(nodeName)) {
+      result = eElement.getTextContent().trim();
+      System.out.println("Success: " + result);
+    } 
+    return result;
+  }
+
+	public static void updateMap(NodeList createResNodeList, NodeList createnewResNodeList, Map<String, ArrayList<String>> erpResponseParamMap,
+			String responseType) {
+				System.out.println("Entering updateMap()");
+		if (createResNodeList != null) {
+			System.out.println("createResNodeList.getLength()"+createResNodeList.getLength());
+			if (createResNodeList.getLength() > 0) {
+				for (int i = 0; i < createResNodeList.getLength(); i++) {
+					Node node = createResNodeList.item(i);
+					NodeList nodeList = node.getChildNodes();
+					 System.out.println("child nodes length: "+nodeList.getLength());
+					String PartCode = null;
+					String Success = "NA";
+					String msg = "NA";
+					String finalVal = "-";
+					ArrayList<String> params = new ArrayList<String>();
+					for (int temp = 0; temp < nodeList.getLength(); temp++) {
+						Node nNode = nodeList.item(temp);
+						 System.out.println("node type: "+nNode.getNodeType());
+						if (nNode.getNodeType() == Node.ELEMENT_NODE) {
+							Element eElement = (Element) nNode;
+							System.out.println("eElement.getTagName(): "+eElement.getTagName());
+							
+							if (eElement.getTagName().equalsIgnoreCase("PartCode")) {
+								PartCode = eElement.getTextContent().trim();
+								System.out.println("The value of PartCode is " + PartCode);
+							}
+							if (eElement.getTagName().equalsIgnoreCase("Success")) {
+								Success = eElement.getTextContent().trim();
+								System.out.println("Success: "+Success);
+
+							}
+							if (eElement.getTagName().equalsIgnoreCase("Message")) {
+								msg = eElement.getTextContent().trim();
+								 System.out.println("Message: "+msg);
+
+							}
+							finalVal = responseType + "~" + msg;
+						//	params.add(Success);
+						//	params.add(finalVal);
+							//params.add(getNodeValue(eElement, "TransactionNumber"));
+							if (eElement.getTagName().equalsIgnoreCase("TransactionNumber")) {
+								params.add(eElement.getTextContent().trim());
+								System.out.println("The value of TransactionNumber is " + eElement.getTextContent().trim());
+							}
+							
+							
+							
+						//	params.add(getNodeValue(eElement, "ObjectID"));
+							if (eElement.getTagName().equalsIgnoreCase("ObjectID")) {
+								params.add(eElement.getTextContent().trim());
+								System.out.println("The value of ObjectID is " + eElement.getTextContent().trim());
+							}
+							//params.add(getNodeValue(eElement, "Class"));
+							if (eElement.getTagName().equalsIgnoreCase("Class")) {
+								params.add(eElement.getTextContent().trim());
+								System.out.println("The value of Class is " + eElement.getTextContent().trim());
+							}
+							//params.add(getNodeValue(eElement, "Action"));
+							if (eElement.getTagName().equalsIgnoreCase("Action")) {
+								params.add(eElement.getTextContent().trim());
+								System.out.println("The value of Action is " + eElement.getTextContent().trim());
+							}
+							params.add(Success);
+							params.add(finalVal);
+							//params.add(getNodeValue(eElement, "TransType"));
+							if (eElement.getTagName().equalsIgnoreCase("TransType")) {
+								params.add(eElement.getTextContent().trim());
+								System.out.println("The value of TransType is " + eElement.getTextContent().trim());
+							}
+							params.add(PartCode);
+						}
+						
+					}
+					
+					if (PartCode != null) {
+						if (!erpResponseParamMap.containsKey(PartCode)) {
+							System.out.println("Adding the PartCode " + PartCode + " to the erpResponseParamMap ");							
+							erpResponseParamMap.put(PartCode, params);
+						} else {
+							System.out.println("Entry already there: " + PartCode + "...............params: " + finalVal);
+							ArrayList<String> vals = erpResponseParamMap.get(PartCode);
+							System.out.println("vals: " + vals.size());
+							ArrayList<String> newParams = new ArrayList<String>();
+							String oldSuccess = vals.get(0);
+							String oldmsg = null;
+							if(vals.size() > 1) {
+								oldmsg = vals.get(1);								
+							}
+							if (Success.equals(oldSuccess)) {
+								newParams.add(oldSuccess);
+							} else {
+								if (oldSuccess.equals("Successfully") || Success.equals("Successfully")) {
+									String newStatus = "Successfully";
+									newParams.add(newStatus);
+								}
+							}
+							String newmsg = null;
+							if(oldmsg != null) {
+								newmsg = oldmsg + "#" + finalVal;
+							}else {
+								newmsg = finalVal;
+							}
+							newParams.add(newmsg);
+							for(int j=2; j<vals.size(); j++)
+							{
+							 newParams.add(vals.get(j));	
+							}
+							System.out.println("The length of newParams.size()" +newParams.size());
+							erpResponseParamMap.remove(PartCode);
+							erpResponseParamMap.put(PartCode, newParams);							
+							
+						}
+					}
+				}
+			}
+		}
+		if (createnewResNodeList != null) {
+			System.out.println("createnewResNodeList.getLength()"+createnewResNodeList.getLength());
+			if (createnewResNodeList.getLength() > 0) {
+				for (int i = 0; i < createnewResNodeList.getLength(); i++) {
+					Node node1 = createnewResNodeList.item(i);
+					NodeList nodeList1 = node1.getChildNodes();
+					 System.out.println("child nodes length: "+nodeList1.getLength());
+					 ArrayList<String> params = new ArrayList<String>();
+					for (int temp = 0; temp < nodeList1.getLength(); temp++) {
+						Node nNode1 = nodeList1.item(temp);
+						 System.out.println("node type: "+nNode1.getNodeType());
+						 if (nNode1.getNodeType() == Node.ELEMENT_NODE) {
+							Element eElement = (Element) nNode1;
+							System.out.println("eElement.getTagName(): "+eElement.getTagName());
+						 if (eElement.getTagName().equalsIgnoreCase("TargetID")) {
+								params.add(eElement.getTextContent().trim());
+								System.out.println("The value of TargetID is " + eElement.getTextContent().trim());
+							}
+						 }
+						 
+		}
+		}
+		}
+		}
+	}
+}
